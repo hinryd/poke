@@ -5,7 +5,7 @@
 ## docker run -d  -p 6003:6003 poketube
 
 # Base (Debian)
-FROM node:20
+FROM node:20 AS builder
 
 # Set Work Directory
 WORKDIR /poketube
@@ -21,5 +21,17 @@ RUN apt-get update && apt-get -y install \
 # Install Packages
 RUN ["npm", "install"]
 
-# Run
-CMD npm start
+# ---- Stage 2: Runtime (distroless, no git needed) ----
+FROM gcr.io/distroless/nodejs20-debian12
+
+WORKDIR /poketube
+
+# Copy built app and node_modules from builder
+COPY --from=builder /poketube /poketube
+
+ENV NODE_ENV=production
+EXPOSE 6003
+
+# Distroless node image has 'node' as entrypoint; provide the script to run.
+# Replace 'server.js' with your real entry file.
+CMD ["server.js"]
