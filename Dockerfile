@@ -5,7 +5,7 @@
 ## docker run -d  -p 6003:6003 poketube
 
 # ---- Stage 1: Builder (has npm) ----
-FROM node:20-alpine AS builder
+FROM node:20 AS builder
 
 WORKDIR /poketube
 COPY . /poketube
