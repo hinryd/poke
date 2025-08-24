@@ -15,8 +15,8 @@ COPY . /poketube
 EXPOSE 6003
 
 # Install Requirements
-# RUN apt-get update && apt-get -y install \
-#     libcurl4-openssl-dev make g++ ca-certificates curl gnupg
+RUN apt-get update && apt-get -y install \
+    libcurl4-openssl-dev make g++ ca-certificates curl gnupg
 
 # Install Packages
 RUN ["npm", "install"]
