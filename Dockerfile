@@ -29,8 +29,9 @@ WORKDIR /poketube
 # Copy built app and node_modules from builder
 COPY --from=builder /poketube /poketube
 
-# Copy the libcurl4 and all necessary dependencies from builder image to distroless
+# Copy all necessary dependencies from builder image to distroless
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libcurl.so.4 /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libnghttp2.so.14 /usr/lib/x86_64-linux-gnu/
 
 ENV NODE_ENV=production
 EXPOSE 6003
