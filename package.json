@@ -31,7 +31,7 @@
     "undici": "^6.14.0",
     "express-rate-limit": "^7.0.2",
     "toobusy-js": "^0.5.1",
-    "quick.db": "^7.1.3",
+    "quick.db": "^9.1.7",
     "activitypub-express": "^4.4.1",
     "duck-duck-scrape": "^2.2.5",
     "google-it": "^1.6.4",
