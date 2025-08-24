@@ -15,7 +15,7 @@ COPY . /poketube
 EXPOSE 6003
 
 # Install Packages
-RUN npm install
+RUN ["npm", "install"]
 
 # Run
 CMD npm start
