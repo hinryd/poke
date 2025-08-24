@@ -20,7 +20,7 @@ const {
 } = require("../ptutils/libpt-coreutils.js");
 const media_proxy = require("../libpoketube-video.js");
 const atmos = require("../../../pokeatmosurls.json");
-const config = require("../../../config.json");
+const config = require("../../../config.js");
 
 function linkify(text) {
   // regular expression to match URLs

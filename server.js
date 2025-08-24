@@ -33,7 +33,7 @@
   const { sinit } = require("./src/libpoketube/init/superinit.js");
   const innertube = require("./src/libpoketube/libpoketube-youtubei-objects.json");
   const fs = require("fs");
-  const config = require("./config.json");
+  const config = require("./config.js");
   const u = await media_proxy();
 
   fs.readFile("ascii_txt.txt", "utf8", (err, data) => {

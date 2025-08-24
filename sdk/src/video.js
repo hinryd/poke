@@ -1,7 +1,7 @@
 
 const fetch = require("node-fetch"); 
 const xmltojson = require("xml2json")
-const url = require("../config.json")
+const url = require("../config.js")
 
 class videoFetchManager{
  static async getVideoJsonByID(ID){

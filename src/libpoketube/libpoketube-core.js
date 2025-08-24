@@ -8,7 +8,7 @@
 
 const getdislikes = require("../libpoketube/libpoketube-dislikes.js");
 const getColors = require("get-image-colors");
-const config = require("../../config.json");
+const config = require("../../config.js");
 
 class InnerTubePokeVidious {
   constructor(config) {

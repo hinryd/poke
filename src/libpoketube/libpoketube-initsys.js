@@ -17,7 +17,7 @@ const core = require("../libpoketube/libpoketube-core.js");
 const INNERTUBE = require("../libpoketube/libpoketube-core.js");
 const musicInfo = require("music-info");
 const wiki = require("wikipedia");
-const config = require("../../config.json")
+const config = require("../../config.js")
 
 const fetch = require("node-fetch");
 const toJson = require("xml2json").toJson;

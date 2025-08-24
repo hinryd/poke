@@ -1,6 +1,6 @@
 const fetch = require("node-fetch"); 
 const xmltojson = require("xml2json")
-const url = require("../config.json")
+const url = require("../config.js")
 
 class PoketubeChannelManager{
   static async GetBasicChannelInfo(CHANNEL_ID){

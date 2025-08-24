@@ -10,7 +10,7 @@ function getJson(str) {
 
 const pkg = require("../../../package.json");
 const os = require('os');
-const cnf = require("../../../config.json");
+const cnf = require("../../../config.js");
 
 
 const innertube = require("../libpoketube-youtubei-objects.json");
