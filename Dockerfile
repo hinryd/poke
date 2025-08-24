@@ -8,12 +8,9 @@
 FROM node:20-alpine AS builder
 
 WORKDIR /poketube
+COPY . /poketube
 
-# Copy only manifest files first for better layer caching
-COPY package*.json ./
-
-# Install only production dependencies
-RUN npm install
+RUN ["npm", "install"]
 
 # Copy the rest of the source
 COPY . .
