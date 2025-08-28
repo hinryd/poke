@@ -1,236 +1,442 @@
 // in the beginning.... god made mrrprpmnaynayaynaynayanyuwuuuwmauwnwanwaumawp :p
 var _yt_player = videojs;
-document.addEventListener("DOMContentLoaded", () => {
-    // video.js 8 init - source can be seen in https://poketube.fun/static/vjs.min.js or the vjs.min.js file 
-    const video = videojs('video', {
-        controls: true,
-        autoplay: false,
-        preload: 'auto'
+
+/**
+ * Self-Healing DASH Player for Video.js
+ * --------------------------------------------------------------
+ * Drop-in controller for MPEG-DASH playback
+ * with Video.js + videojs-contrib-dash (dash.js underneath).
+ *
+ * WHAT THIS SCRIPT DOES
+ * - Loads MPD from `window.mpdurl` and starts from 0s (fixes “starts at 5–7s”).
+ * - Probes quality in order: 1080p → 720p → 480p with ABR OFF, then
+ *   re-enables ABR with soft bounds (floor ≈ 430p if available, cap 1080p).
+ * - Monitors health; if playback stops advancing, it silently refreshes
+ *   the same MPD and resumes from the saved time (exponential backoff).
+ * - On player/demux/network hiccups it flips back to full ABR for safety.
+ *
+ * CORS / NETWORK HARDENING
+ * - Forces cookie-less segment/MPD requests (withCredentials=false per type).
+ * - Disables CMCD headers (or uses query mode) to avoid preflights.
+ * - Request interceptor strips non-essential custom headers on non-license
+ *   calls. The <video> element is set to crossorigin="anonymous".
+ * - The MPD URL is “normalized” first via fetch(..., credentials:'omit') to
+ *   collapse redirects that can drop ACAO headers.
+ *
+ * ERROR UI SUPPRESSION
+ * - `errorDisplay:false` hides the default “No compatible source …” overlay.
+ * - If any component still sets a stale MediaError, we clear it programmatically
+ *   (`player.error(null)`, remove `vjs-error`) whenever playback is actually OK.
+ *
+ * REQUIREMENTS
+ * - Video.js 7/8, videojs-contrib-dash, dash.js loaded before this script.
+ * - <video id="video"> exists in the DOM. Provide `window.mpdurl` (string).
+ *
+ * TUNABLE KNOBS (search constants below)
+ * - PROBE_OK_PLAY_MS, STALL_FAIL_MS, PROBE_TIMEOUT_MS: probe behavior.
+ * - WATCH_GRACE_MS, STEPS[]: health watchdog & silent refresh backoff.
+ * - ABR bounds: floor ≈ 430p, cap 1080p (adjust inside enableBoundedABR).
+ *
+ * DRM NOTE
+ * - By default all requests are credential-free to minimize CORS breaks.
+ *   If your license server requires credentials, selectively enable them:
+ *   dash.setXHRWithCredentialsForType(HTTPRequest.LICENSE, true) and
+ *   allow only the minimal headers required for the license endpoint.
+ *
+ * USAGE
+ * - Include after the libraries; no other wiring needed. Last reviewed: Aug 2025.
+ */
+
+document.addEventListener('DOMContentLoaded', () => {
+  // ---- housekeeping ----
+  const qs = new URLSearchParams(location.search);
+  const vidKey = qs.get('v') || '';
+  if (vidKey) { try { localStorage.removeItem(`progress-${vidKey}`); } catch {} }
+
+  const MPD_URL = (typeof window !== 'undefined' && window.mpdurl) ? String(window.mpdurl) : '';
+  if (!MPD_URL) { console.error('[dash] window.mpdurl is not set'); return; }
+
+  // Ensure the underlying <video> never taints or sends cookies by default
+  try { document.getElementById('video')?.setAttribute('crossorigin', 'anonymous'); } catch {}
+
+  // --- tiny helper: resolve final URL without cookies & with CORS mode ---
+  async function normalizeMpdUrl(url) {
+    try {
+      const resp = await fetch(url, {
+        method: 'GET',
+        mode: 'cors',
+        redirect: 'follow',
+        credentials: 'omit',
+        cache: 'no-store'
+      });
+      if (resp && resp.ok && resp.url) return resp.url;
+    } catch {}
+    return url;
+  }
+
+  // === ERROR UI SUPPRESSION ===
+  // (A) disable overlay via option (prevents the big black “No compatible source…” box)
+  const player = videojs('video', {
+    controls: true,
+    autoplay: false,
+    preload: 'auto',
+    errorDisplay: false // <— documented way to hide the error UI
+  });
+
+  // (B) auto-clear any false/legacy errors that might still be set by other plugins
+  function clearFalseErrorUI() {
+    try {
+      // Clear any stored MediaError on the player; hide overlay if a plugin added it
+      if (typeof player.error === 'function') player.error(null);
+      player.removeClass('vjs-error');
+      const ed = player.getChild && player.getChild('errorDisplay');
+      if (ed && typeof ed.hide === 'function') ed.hide();
+    } catch {}
+  }
+
+  // Call the clearer anytime we know playback is actually OK.
+  ['loadstart','loadedmetadata','canplay','playing','timeupdate','seeked'].forEach(ev => {
+    player.on(ev, clearFalseErrorUI);
+  });
+
+  // ---- utils ----
+  const KBPS = (info) => {
+    if (!info) return 0;
+    if (typeof info.bitrate === 'number')   return info.bitrate;
+    if (typeof info.bandwidth === 'number') return Math.round(info.bandwidth/1000);
+    return 0;
+  };
+
+  const hasIdAPI = (dash) =>
+    typeof dash.getRepresentationsByType === 'function' &&
+    typeof dash.setRepresentationForTypeById === 'function';
+
+  function setQualityByIdOrIndex(dash, repId, index) {
+    try {
+      if (repId && hasIdAPI(dash)) dash.setRepresentationForTypeById('video', repId);
+      else if (typeof dash.setQualityFor === 'function' && index >= 0) dash.setQualityFor('video', index);
+    } catch {}
+  }
+
+  function repAtOrBelow(targetH, reps, levels) {
+    let best = null;
+    for (const r of reps) {
+      const h = (r && r.height) || 0;
+      if (h <= targetH && (!best || h > (best.height || 0))) best = r;
+    }
+    if (!best) return { id: null, idx: -1, height: 0 };
+    let idx = -1;
+    for (let i = 0; i < (levels || []).length; i++) {
+      if ((levels[i].height || 0) === (best.height || 0)) idx = i;
+    }
+    return { id: best.id, idx, height: best.height || 0 };
+  }
+
+  function bitrateBoundsForHeights(levels, floorH, capH) {
+    const sorted = levels.map((it, i) => ({ i, h: it.height || 0, kbps: KBPS(it) })).sort((a,b)=>a.h-b.h);
+    let minKbps = -1, maxKbps = -1;
+    const floor = sorted.find(x => x.h >= floorH);
+    if (floor && floor.kbps > 0) minKbps = floor.kbps;
+    const caps = sorted.filter(x => x.h > 0 && x.h <= capH);
+    if (caps.length) {
+      const top = caps[caps.length - 1];
+      if (top.kbps > 0) maxKbps = top.kbps;
+    }
+    return { minKbps, maxKbps };
+  }
+
+  // ---- probe a quality for smoothness ----
+  const PROBE_OK_PLAY_MS = 4500;
+  const STALL_FAIL_MS    = 2000;
+  const PROBE_TIMEOUT_MS = 8000;
+
+  function probeQuality(dash, cand) {
+    return new Promise((resolve) => {
+      let okPlay = 0, lastAdvanceAt = performance.now(), lastT = player.currentTime() || 0;
+      let waitingSince = null, done = false;
+
+      const cleanup = () => {
+        player.off('timeupdate', onTime);
+        player.off('waiting', onWaiting);
+        player.off('playing', onPlaying);
+        player.off('error', onErr);
+        clearTimeout(overallTO);
+      };
+      const finish = (ok) => { if (done) return; done = true; cleanup(); resolve(ok); };
+
+      try {
+        dash.updateSettings({
+          streaming: {
+            abr: { autoSwitchBitrate: { video: false, audio: true } },
+            fastSwitchEnabled: true,
+            limitBitrateByPortal: false
+          }
+        });
+        setQualityByIdOrIndex(dash, cand.id, cand.idx);
+      } catch {}
+
+      player.play().catch(()=>{});
+
+      const onPlaying = () => { waitingSince = null; };
+      const onWaiting = () => { waitingSince = performance.now(); };
+      const onErr     = () => finish(false);
+
+      const onTime = () => {
+        const now = performance.now();
+        const ct  = player.currentTime() || 0;
+        if (ct > lastT + 0.04) {
+          okPlay += (now - lastAdvanceAt);
+          lastAdvanceAt = now;
+          lastT = ct;
+        }
+        if (waitingSince && (now - waitingSince) >= STALL_FAIL_MS) { finish(false); return; }
+        if (okPlay >= PROBE_OK_PLAY_MS) { finish(true); }
+      };
+
+      player.on('playing', onPlaying);
+      player.on('waiting', onWaiting);
+      player.on('timeupdate', onTime);
+      player.on('error', onErr);
+
+      const overallTO = setTimeout(() => finish(false), PROBE_TIMEOUT_MS);
     });
+  }
 
-    // todo : remove this code lol
-    const qua = new URLSearchParams(window.location.search).get("quality") || "";
-    const vidKey = new URLSearchParams(window.location.search).get('v');
-    localStorage.setItem(`progress-${vidKey}`, 0);
-
-    // raw media elements
-    const videoEl = document.getElementById('video');
-    const audio = document.getElementById('aud');
-
-    const audioSrc = audio.getAttribute('src');
-    const vidSrcObj = video.src();
-    const videoSrc = Array.isArray(vidSrcObj) ? vidSrcObj[0].src : vidSrcObj;
-
-    let audioReady = false, videoReady = false;
-    let syncInterval = null;
-
-    // pauses and syncs the video when the seek is finished :3
-    function clearSyncLoop() {
-        if (syncInterval) {
-            clearInterval(syncInterval);
-            syncInterval = null;
-            audio.playbackRate = 1;
+  // ---- ABR control ----
+  function enableBoundedABR(dash, levels, floorH = 430, capH = 1080, biasIdx = -1) {
+    const { minKbps, maxKbps } = bitrateBoundsForHeights(levels, floorH, capH);
+    const biasKbps = biasIdx >= 0 ? (KBPS(levels[biasIdx]) || -1) : -1;
+    try {
+      dash.updateSettings({
+        streaming: {
+          abr: {
+            autoSwitchBitrate: { video: true, audio: true },
+            minBitrate: { video: minKbps, audio: -1 },
+            maxBitrate: { video: maxKbps, audio: -1 },
+            initialBitrate: { video: biasKbps > 0 ? biasKbps : (maxKbps > 0 ? maxKbps : -1), audio: -1 }
+          },
+          fastSwitchEnabled: true,
+          limitBitrateByPortal: false
         }
-    }
+      });
+    } catch {}
+  }
 
-    // drift-compensation loop for micro-sync
-    function startSyncLoop() {
-        clearSyncLoop();
-        syncInterval = setInterval(() => {
-            const vt = video.currentTime();
-            const at = audio.currentTime;
-            const delta = vt - at;
-
-            // large drift → jump
-            if (Math.abs(delta) > 0.5) {
-                audio.currentTime = vt;
-                audio.playbackRate = 1;
-            }
-            // micro drift → adjust rate
-            else if (Math.abs(delta) > 0.05) {
-                audio.playbackRate = 1 + delta * 0.1;
-            } else {
-                audio.playbackRate = 1;
-            }
-        }, 300);
-    }
-
-    // align start when both are ready
-    function tryStart() {
-        if (audioReady && videoReady) {
-            const t = video.currentTime();
-            if (Math.abs(audio.currentTime - t) > 0.1) {
-                audio.currentTime = t;
-            }
-            video.play();
-            audio.play();
-            startSyncLoop();
-            setupMediaSession();
+  function enableFullABR(dash) {
+    try {
+      dash.updateSettings({
+        streaming: {
+          abr: { autoSwitchBitrate: { video: true, audio: true } },
+          fastSwitchEnabled: true,
+          limitBitrateByPortal: false
         }
+      });
+    } catch {}
+  }
+
+  // ---- health watchdog + recovery ----
+  const WATCH_GRACE_MS = 2500;
+  let watch = { t: 0, at: 0, on: false };
+
+  function startWatch() { watch.t = player.currentTime() || 0; watch.at = performance.now(); watch.on = true; }
+  function stopWatch()  { watch.on = false; }
+
+  const STEPS = [250, 400, 650, 900, 1200, 1600, 2100, 2800, 3600];
+  let retryCount = 0;
+  function backoffDelay() {
+    const base = STEPS[Math.min(retryCount, STEPS.length - 1)];
+    const jitter = Math.floor((Math.random()*2 - 1) * 120);
+    retryCount++;
+    return Math.max(150, base + jitter);
+  }
+
+  function healthy() {
+    try {
+      if (!player.paused() && (player.currentTime() || 0) > 0) return true;
+      const el = player.tech_ && player.tech_.el && player.tech_.el();
+      if (el && typeof el.readyState === 'number' && el.readyState >= 2) return true;
+    } catch {}
+    return false;
+  }
+
+  function refreshSameSource(keepTime) {
+    const cur = player.currentSource();
+    if (!cur || !cur.src) return;
+    try {
+      player.pause();
+      player.src(cur);
+      player.one('loadeddata', () => {
+        try { if (isFinite(keepTime) && keepTime > 0) player.currentTime(keepTime); } catch {}
+        player.play().catch(()=>{});
+        clearFalseErrorUI(); // make sure any overlay is gone after a refresh
+      });
+    } catch {}
+  }
+
+  function scheduleHeal() {
+    if (healthy()) { retryCount = 0; return; }
+    if ('onLine' in navigator && !navigator.onLine) {
+      const onlineOnce = () => { window.removeEventListener('online', onlineOnce); scheduleHeal(); };
+      window.addEventListener('online', onlineOnce, { once: true });
+      return;
     }
+    const keep = player.currentTime() || 0;
+    const delay = backoffDelay();
+    setTimeout(() => refreshSameSource(keep), delay);
+  }
 
-    // simple one-time retry on error
-    function attachRetry(elm, src, markReady) {
-        elm.addEventListener('loadeddata', () => {
-            markReady();
-            tryStart();
-        }, { once: true });
+  // ---- fix “starts at 5–7s”: always rewind to 0 once after setup ----
+  const DESIRED_START = 0;
+  let didResetStart = false;
+  function resetToStartOnce() {
+    if (didResetStart) return;
+    didResetStart = true;
+    try {
+      if ((player.currentTime() || 0) > DESIRED_START + 0.05) {
+        player.pause();
+        player.currentTime(DESIRED_START);
+        player.one('seeked', () => player.play().catch(()=>{}));
+      } else {
+        player.play().catch(()=>{});
+      }
+    } catch {}
+    clearFalseErrorUI();
+  }
 
-        elm.addEventListener('error', () => {
-            // only retry once, and only if we have a valid src
-            if (!elm._didRetry && src) {
-                elm._didRetry = true;
-                elm.src = src;
-                elm.load();
-            } else {
-                console.error(`${elm.tagName} failed to load.`);
-            }
-        }, { once: true });
-    }
+  // ---- orchestrate load + probing + ABR + CORS hardening ----
+  player.ready(async () => {
+    const finalUrl = await normalizeMpdUrl(MPD_URL);
+    player.src({ src: finalUrl, type: 'application/dash+xml' });
 
-    // le volume :3
-    function setupMediaSession() {
-        if ('mediaSession' in navigator) {
-            navigator.mediaSession.metadata = new MediaMetadata({
-                title: document.title || 'Video',
-                artist: '',
-                album: '',
-                artwork: []
-            });
+    player.one('loadedmetadata', async () => {
+      const dash = player.dash && player.dash.mediaPlayer;
+      if (!dash) return;
 
-            navigator.mediaSession.setActionHandler('play', () => {
-                video.play(); audio.play();
-            });
-            navigator.mediaSession.setActionHandler('pause', () => {
-                video.pause(); audio.pause();
-            });
-            navigator.mediaSession.setActionHandler('seekbackward', ({ seekOffset }) => {
-                const skip = seekOffset || 10;
-                video.currentTime(video.currentTime() - skip);
-                audio.currentTime -= skip;
-            });
-            navigator.mediaSession.setActionHandler('seekforward', ({ seekOffset }) => {
-                const skip = seekOffset || 10;
-                video.currentTime(video.currentTime() + skip);
-                audio.currentTime += skip;
-            });
-            navigator.mediaSession.setActionHandler('seekto', ({ seekTime, fastSeek }) => {
-                if (fastSeek && 'fastSeek' in audio) audio.fastSeek(seekTime);
-                else audio.currentTime = seekTime;
-                video.currentTime(seekTime);
-            });
-            navigator.mediaSession.setActionHandler('stop', () => {
-                video.pause(); audio.pause();
-                video.currentTime(0); audio.currentTime = 0;
-                clearSyncLoop();
-            });
+      // 1) Hard-disable credentials for all request types
+      try {
+        const H = (window.dashjs && window.dashjs.HTTPRequest) || {};
+        const TYPES = [
+          H.MPD_TYPE, H.MEDIA_SEGMENT_TYPE, H.INIT_SEGMENT_TYPE,
+          H.BITSTREAM_SWITCHING_SEGMENT_TYPE, H.INDEX_SEGMENT_TYPE,
+          H.MSS_FRAGMENT_INFO_SEGMENT_TYPE, H.LICENSE, H.OTHER_TYPE, H.XLINK_EXPANSION_TYPE
+        ].filter(Boolean);
+        if (typeof dash.setXHRWithCredentialsForType === 'function') {
+          TYPES.forEach(t => { try { dash.setXHRWithCredentialsForType(t, false); } catch {} });
         }
-    }
+      } catch {}
 
-    // ** DESKTOP MEDIA-KEY FALLBACK **
-    document.addEventListener('keydown', e => {
-        switch (e.code) {
-            case 'AudioPlay':
-            case 'MediaPlayPause':
-                if (video.paused()) { video.play(); audio.play(); }
-                else            { video.pause(); audio.pause(); }
-                break;
+      // 2) Prevent CMCD headers (no preflights)
+      try {
+        dash.updateSettings({
+          streaming: {
+            cmcd: { enabled: false, mode: 'query', includeInRequests: ['segment','mpd'] }
+          }
+        });
+      } catch {}
 
-            case 'AudioPause':
-                video.pause(); audio.pause();
-                break;
-
-            case 'AudioNext':
-            case 'MediaTrackNext':
-                const tFwd = video.currentTime() + 10;
-                video.currentTime(tFwd); audio.currentTime += 10;
-                break;
-
-            case 'AudioPrevious':
-            case 'MediaTrackPrevious':
-                const tBwd = video.currentTime() - 10;
-                video.currentTime(tBwd); audio.currentTime -= 10;
-                break;
+      // 3) Strip creds/headers on non-license
+      try {
+        if (typeof dash.addRequestInterceptor === 'function') {
+          dash.addRequestInterceptor((req) => {
+            try {
+              const isLicense = /license|widevine|playready|fairplay/i.test(String(req?.url || ''));
+              if (!isLicense) {
+                req.withCredentials = false;
+                if (req.headers) {
+                  delete req.headers.Authorization;
+                  delete req.headers['X-Requested-With'];
+                  delete req.headers['X-CSRF-Token'];
+                  delete req.headers['Cookie'];
+                }
+              }
+            } catch {}
+            return Promise.resolve(req);
+          });
         }
+      } catch {}
+
+      // --- quality probing & ABR bounds ---
+      const levels = (typeof dash.getBitrateInfoListFor === 'function' ? dash.getBitrateInfoListFor('video') : []) || [];
+      const reps   = (typeof dash.getRepresentationsByType === 'function' ? dash.getRepresentationsByType('video') : []) || [];
+
+      function pick(targetH) {
+        if (reps.length) return repAtOrBelow(targetH, reps, levels);
+        let idx = -1, bestH = -1;
+        for (let i = 0; i < levels.length; i++) {
+          const h = levels[i].height || 0;
+          if (h <= targetH && h > bestH) { idx = i; bestH = h; }
+        }
+        return { id: null, idx, height: bestH };
+      }
+
+      const c1080 = pick(1080);
+      const c720  = pick(720);
+      const c480  = pick(480);
+
+      const candidates = [];
+      if (c1080.idx >= 0 || c1080.id) candidates.push({ id: c1080.id, idx: c1080.idx });
+      if ((c720.idx  >= 0 || c720.id)  && (c720.idx !== c1080.idx || c720.id !== c1080.id)) candidates.push({ id: c720.id, idx: c720.idx });
+      if ((c480.idx  >= 0 || c480.id)  && (c480.idx !== c720.idx  || c480.id !== c720.id))   candidates.push({ id: c480.id, idx: c480.idx });
+      if (!candidates.length && levels.length) candidates.push({ id: null, idx: levels.length - 1 });
+
+      let chosenIdx = -1;
+      for (const cand of candidates) {
+        const ok = await probeQuality(dash, cand);
+        if (ok) { chosenIdx = (typeof cand.idx === 'number' ? cand.idx : -1); enableBoundedABR(dash, levels, 430, 1080, chosenIdx); break; }
+      }
+      if (chosenIdx < 0) enableFullABR(dash);
+
+      resetToStartOnce();
+      startWatch();
     });
+  });
 
-    if (qua !== "medium") {
-        // attach retry & ready markers to the real elements
-        attachRetry(audio,    audioSrc, () => { audioReady = true; });
-        attachRetry(videoEl,  videoSrc, () => { videoReady = true; });
-
-        // Sync when playback starts
-        video.on('play', () => {
-            if (!syncInterval) startSyncLoop();
-            if (Math.abs(video.currentTime() - audio.currentTime) > 0.3) {
-                audio.currentTime = video.currentTime();
-            }
-            if (audioReady) audio.play();
-        });
-
-        video.on('pause', () => {
-            audio.pause();
-            clearSyncLoop();
-        });
-
-        // pause audio when video is buffering :3
-        video.on('waiting', () => {
-            audio.pause();
-            clearSyncLoop();
-        });
-
-        // resume audio when video resumes
-        video.on('playing', () => {
-            if (audioReady) audio.play();
-            if (!syncInterval) startSyncLoop();
-        });
-
-        // pauses and syncs on seek
-        video.on('seeking', () => {
-            audio.pause();
-            clearSyncLoop();
-            if (Math.abs(video.currentTime() - audio.currentTime) > 0.3) {
-                audio.currentTime = video.currentTime();
-            }
-        });
-
-        video.on('seeked', () => {
-            if (audioReady) audio.play();
-            if (!syncInterval) startSyncLoop();
-        });
-
-        // volume sync
-        video.on('volumechange', () => {
-            audio.volume = video.volume();
-        });
-        audio.addEventListener('volumechange', () => {
-            video.volume(audio.volume);
-        });
-
-        // Detects when video or audio finishes buffering
-        video.on('canplaythrough', () => {
-            if (Math.abs(video.currentTime() - audio.currentTime) > 0.3) {
-                audio.currentTime = video.currentTime();
-            }
-        });
-        audio.addEventListener('canplaythrough', () => {
-            if (Math.abs(video.currentTime() - audio.currentTime) > 0.3) {
-                audio.currentTime = video.currentTime();
-            }
-        });
-
-        // pause if it becomes full screen :3
-        document.addEventListener('fullscreenchange', () => {
-            if (!document.fullscreenElement) {
-                video.pause();
-                audio.pause();
-                clearSyncLoop();
-            }
-        });
+  // ---- health & stall handling ----
+  player.on('timeupdate', () => {
+    if (!watch.on) return;
+    const ct = player.currentTime() || 0;
+    if (ct !== watch.t) { watch.t = ct; watch.at = performance.now(); return; }
+    if (!player.paused() && (performance.now() - watch.at) > WATCH_GRACE_MS) {
+      scheduleHeal();
+      watch.on = false;
+      setTimeout(startWatch, 1200);
     }
+  });
+
+  player.on('playing',  () => { retryCount = 0; startWatch(); });
+  player.on('waiting',  () => { scheduleHeal(); });
+  player.on('stalled',  () => { scheduleHeal(); });
+  player.on('suspend',  () => { scheduleHeal(); });
+  player.on('emptied',  () => { scheduleHeal(); });
+  player.on('abort',    () => { scheduleHeal(); });
+
+  // ---- if any error slips through, clear UI if playback is actually fine ----
+  function looksLikeCorsy(err) {
+    const s = String((err && (err.message || err.statusText)) || '');
+    return /cors|cross[- ]origin|allow-?origin|credentials|taint/i.test(s);
+  }
+  player.on('error', () => {
+    try {
+      const dash = player.dash && player.dash.mediaPlayer;
+      if (dash) enableFullABR(dash);
+    } catch {}
+    const err = player.error && player.error();
+
+    // If we can control playback or see progress, treat as spurious UI error and clear it
+    const progressed = (player.currentTime() || 0) > 0 || (player.buffered && player.buffered().length > 0);
+    if (progressed || !err || err.code === 2 || err.code === 3 || looksLikeCorsy(err)) {
+      clearFalseErrorUI();
+      // also attempt a soft refresh when appropriate
+      if (!progressed) {
+        const keep = player.currentTime() || 0;
+        refreshSameSource(keep);
+      }
+    }
+  });
+
+  // ---- offline/online bridge ----
+  window.addEventListener('online',  () => scheduleHeal());
 });
-
-
 
 // hai!! if ur asking why are they here - its for smth in the future!!!!!!
 
@@ -558,30 +764,91 @@ function validatePlayerObject(player) {
 
 const extractedData = extractPlayerData(base_player);
 const initializedPlayer = initializePlayer(extractedData);
+ 
 
-
-const saa = document.createElement('style');
+ const saa = document.createElement('style');
 saa.innerHTML = `
-.vjs-play-progress {
-  background-image: linear-gradient(to right, 
-    #ff0045,    
-    #ff0e55,   
-    #ff1d79  
-  );
+.vjs-play-progress{background-image:linear-gradient(to right,#ff0045,#ff0e55,#ff1d79)}
+
+/* move the whole controls panel up a bit so buttons fit */
+.video-js .vjs-control-bar{bottom:12px!important}
+
+/* control bar: clean baseline */
+.vjs-control-bar{
+  background:transparent!important;border:none!important;box-shadow:none!important;
+  display:flex!important;align-items:center!important;gap:2px;padding:6px 10px;border-radius:16px
+}
+.vjs-remaining-time,.vjs-fullscreen-control{background-color:transparent!important}
+
+/* glassy circular controls */
+.vjs-control-bar .vjs-button{
+  width:38px;height:38px;min-width:38px;border-radius:50%;
+  background:linear-gradient(180deg,rgba(255,255,255,.18),rgba(255,255,255,.08));
+  -webkit-backdrop-filter:blur(12px) saturate(160%);backdrop-filter:blur(12px) saturate(160%);
+  border:1px solid rgba(255,255,255,.18);
+  box-shadow:0 8px 24px rgba(0,0,0,.35),inset 0 0 0 1px rgba(255,255,255,.10);
+  display:inline-flex;align-items:center;justify-content:center;margin:0 6px;
+  transition:transform .12s ease,box-shadow .2s ease,background .2s ease;vertical-align:middle
+}
+.vjs-control-bar .vjs-button:hover{background:linear-gradient(180deg,rgba(255,255,255,.24),rgba(255,255,255,.12));box-shadow:0 10px 28px rgba(0,0,0,.4),inset 0 0 0 1px rgba(255,255,255,.16);transform:translateY(-1px)}
+.vjs-control-bar .vjs-button:active{transform:translateY(0)}
+.vjs-control-bar .vjs-button:focus-visible{outline:none;box-shadow:0 0 0 3px rgba(255,0,90,.35),inset 0 0 0 1px rgba(255,255,255,.2)}
+.vjs-control-bar .vjs-icon-placeholder:before{font-size:18px;line-height:38px}
+
+/* center the time text vertically like buttons */
+.vjs-current-time,.vjs-time-divider,.vjs-duration,.vjs-remaining-time{
+  background:transparent;padding:0 8px;border-radius:999px;box-shadow:none;margin:0;
+  height:38px;line-height:1;display:inline-flex;align-items:center
 }
 
-.vjs-control-bar {
-  border-radius: 16px;
-  background-color: #0007 !important; 
+/* progress: glass capsule like the buttons */
+.vjs-progress-control{
+  flex:1 1 auto;display:flex!important;align-items:center!important;margin:0 6px;padding:0;height:38px
+}
+.vjs-progress-control .vjs-progress-holder{
+  height:8px!important;border-radius:999px!important;background:transparent!important;border:none;box-shadow:none;
+  position:relative;margin:0;width:100%
+}
+/* glass capsule background (same vibe as circular buttons) */
+.vjs-progress-control .vjs-progress-holder::before{
+position:absolute;inset:0;border-radius:inherit;
+  background:linear-gradient(180deg,rgba(255,255,255,.18),rgba(255,255,255,.08));
+  -webkit-backdrop-filter:blur(12px) saturate(160%);backdrop-filter:blur(12px) saturate(160%);
+  border:1px solid rgba(255,255,255,.18);
+  box-shadow:0 8px 24px rgba(0,0,0,.35),inset 0 0 0 1px rgba(255,255,255,.10);
+  pointer-events:none
+}
+/* keep bars above the capsule bg */
+.vjs-progress-control .vjs-load-progress,
+.vjs-progress-control .vjs-play-progress{position:relative;z-index:1;border-radius:inherit!important}
+.vjs-progress-control .vjs-play-progress{background-image:linear-gradient(to right,#ff0045,#ff0e55,#ff1d79)!important}
+.vjs-progress-control .vjs-slider-handle{
+  width:14px!important;height:14px!important;border-radius:50%!important;background:#fff!important;border:1px solid rgba(255,255,255,.9);
+  box-shadow:0 6px 18px rgba(0,0,0,.35),0 0 0 3px rgba(255,0,90,.20);top:-4px!important;z-index:2
 }
 
-.vjs-remaining-time, 
-.vjs-fullscreen-control {
-  background-color: transparent !important;   
+/* volume aligned to baseline; simple track */
+.vjs-volume-panel{gap:8px;align-items:center!important;padding:0;height:38px}
+.vjs-volume-bar{height:6px!important;border-radius:999px!important;background:#2c2c2c!important;border:none;box-shadow:none;position:relative}
+.vjs-volume-level{border-radius:inherit!important;background-image:linear-gradient(to right,#ff0045,#ff1d79)!important}
+.vjs-volume-bar .vjs-slider-handle{
+  width:12px!important;height:12px!important;border-radius:50%!important;background:#fff!important;border:1px solid rgba(255,255,255,.9);
+  top:-3px!important;box-shadow:0 4px 14px rgba(0,0,0,.3),0 0 0 3px rgba(255,0,90,.18)
+}
+
+/* small screens */
+@media (max-width:640px){
+  .video-js .vjs-control-bar{bottom:10px!important}
+  .vjs-control-bar{gap:8px;padding:6px 8px}
+  .vjs-control-bar .vjs-button{width:34px;height:34px;min-width:34px}
+  .vjs-control-bar .vjs-icon-placeholder:before{font-size:16px;line-height:34px}
+  .vjs-current-time,.vjs-time-divider,.vjs-duration,.vjs-remaining-time{height:34px}
+  .vjs-progress-control{height:34px}
+  .vjs-progress-control .vjs-slider-handle{width:12px!important;height:12px!important;top:-3px!important}
 }
 `;
-
 document.head.appendChild(saa);
+
 
 window.pokePlayer = {
     ver:`20-a87a9450-vjs-${videojs.VERSION}`,
